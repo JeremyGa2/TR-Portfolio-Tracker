@@ -1,6 +1,8 @@
 # 📊 TR-Portfolio-Tracker
 
-Une application élégante pour suivre et gérer votre portefeuille d'investissements en temps réel.
+Une application élégante pour suivre et gérer votre portefeuille d'investissements en temps réel simplement en uploadant le .CSV fourni par trade republic dans > Profil > Relevés > Exportation de transactions.
+
+Il suffit ensuite d'uploader le fichier .csv dans le html.
 
 ## ✨ Caractéristiques
 
