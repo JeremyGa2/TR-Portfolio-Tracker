@@ -1,69 +1,102 @@
-# 📊 TR-Portfolio-Tracker
+<div align="center">
 
-Une application élégante pour suivre et gérer votre portefeuille d'investissements en temps réel simplement en uploadant le .CSV fourni par trade republic dans > Profil > Relevés > Exportation de transactions.
+# 📊 TR Portfolio Tracker
 
-Il suffit ensuite d'uploader le fichier .csv dans le html.
+**Suivez et analysez votre portefeuille Trade Republic — 100% dans votre navigateur, zéro serveur.**
 
-## ✨ Caractéristiques
+[![HTML](https://img.shields.io/badge/HTML-Standalone-orange?style=flat-square&logo=html5)](./Portfolio_Tracker.html)
+[![React](https://img.shields.io/badge/React-18-61dafb?style=flat-square&logo=react)](https://react.dev)
+[![Recharts](https://img.shields.io/badge/Recharts-Graphiques-22c55e?style=flat-square)](https://recharts.org)
+[![Licence](https://img.shields.io/badge/Licence-MIT-blue?style=flat-square)](./LICENSE)
+[![Confidentialité](https://img.shields.io/badge/Données-100%25%20locales-purple?style=flat-square&logo=shield)](.)
 
-- **Suivi en temps réel** - Consultez la valeur de votre portefeuille instantanément
-- **Gestion d'actifs** - Ajoutez, modifiez et supprimez vos investissements facilement
-- **Historique détaillé** - Visualisez l'évolution de votre portefeuille au fil du temps
-- **Interface intuitive** - Design moderne et ergonomique
-- **Rapports analytiques** - Analysez vos performances et vos gains/pertes
-
-## 🚀 Démarrage rapide
-
-### Prérequis
-- Node.js (v16 ou supérieur)
-- npm ou yarn
-
-### Installation
-
-```bash
-# Cloner le repository
-git clone https://github.com/JeremyGa2/TR-Portfolio-Tracker.git
-
-# Installer les dépendances
-cd TR-Portfolio-Tracker
-npm install
-
-# Lancer l'application
-npm start
-```
-
-## 📋 Utilisation
-
-1. **Créer un compte** - Inscrivez-vous ou connectez-vous
-2. **Ajouter des actifs** - Enregistrez vos investissements
-3. **Suivre la performance** - Consultez les graphiques et statistiques
-4. **Optimiser** - Analysez votre allocation pour améliorer votre portefeuille
-
-## 🛠️ Technologies utilisées
-
-- **Frontend** - React / Vue.js
-- **Backend** - Node.js / Express
-- **Base de données** - MongoDB / PostgreSQL
-- **Styling** - Tailwind CSS / Bootstrap
-
-## 📝 Licence
-
-Ce projet est sous la licence MIT. Consultez le fichier [LICENSE](LICENSE) pour plus de détails.
-
-## 🤝 Contribuer
-
-Les contributions sont les bienvenues ! N'hésitez pas à :
-
-1. Fork le projet
-2. Créer une branche pour votre fonctionnalité (`git checkout -b feature/AmazingFeature`)
-3. Commiter vos changements (`git commit -m 'Add some AmazingFeature'`)
-4. Pusher vers la branche (`git push origin feature/AmazingFeature`)
-5. Ouvrir une Pull Request
-
-## 📧 Contact
-
-Pour toute question ou suggestion, veuillez ouvrir une [issue](https://github.com/JeremyGa2/TR-Portfolio-Tracker/issues) ou me contacter directement.
+</div>
 
 ---
 
-**Faites croître votre richesse, pas votre stress.** 📈💡
+## ✨ Fonctionnalités
+
+| | Fonctionnalité | Description |
+|---|---|---|
+| 📥 | **Import CSV** | Glissez-déposez l'export Trade Republic, c'est tout |
+| 📈 | **Dashboard temps réel** | Valeur du portefeuille, P&L, rendement global |
+| 🗂️ | **Secteurs automatiques** | Détection par ISIN et nom : Défense, Semi-conducteurs, Uranium, Tech, ETF… |
+| 🎨 | **Graphiques interactifs** | Évolution, répartition, performance par actif (Recharts) |
+| 💰 | **Prix manuels** | Mettez à jour les cours en un clic |
+| 🔒 | **100% privé** | Aucune donnée ne quitte votre machine — tout en localStorage |
+
+---
+
+## 🚀 Démarrage en 30 secondes
+
+> **Aucune installation requise.** Pas de Node.js, pas de serveur, pas de compte.
+
+**1.** Téléchargez [`Portfolio_Tracker.html`](./Portfolio_Tracker.html)
+
+**2.** Exportez vos transactions depuis Trade Republic :
+> *Profil → Relevés → Exportation de transactions → `.csv`*
+
+**3.** Ouvrez le fichier HTML dans votre navigateur et uploadez le CSV
+
+C'est tout. 🎉
+
+---
+
+## 🗂️ Secteurs reconnus automatiquement
+
+```
+🔴 Défense          🔵 Semi-conducteurs     🟢 Uranium & Nucléaire
+🟡 Or & Métaux      🟣 Crypto               🔵 ETF Monde / Émergents
+⚡ Tech & Mega Caps  🟤 Commodities          🟠 Énergie
+💳 Finance          💊 Santé & Pharma       💎 Luxe
+```
+
+Détection par **ISIN** en priorité, puis par **mots-clés** sur le nom de l'actif.
+Tout actif non reconnu tombe dans *Autre* — et vous pouvez forcer le secteur manuellement.
+
+---
+
+## 🛠️ Stack technique
+
+| Couche | Technologie |
+|---|---|
+| UI | React 18 (via CDN — aucun build nécessaire) |
+| Graphiques | Recharts |
+| Icônes | Lucide React |
+| Fichiers Excel/CSV | SheetJS (xlsx) |
+| Persistance | `localStorage` du navigateur |
+
+---
+
+## 📁 Structure du projet
+
+```
+TR-Portfolio-Tracker/
+├── Portfolio_Tracker.html   # Application complète (ouvrir directement)
+├── Portfolio_Tracker.jsx    # Code source React
+├── .gitignore
+└── README.md
+```
+
+> ⚠️ Les fichiers CSV Trade Republic contiennent des données financières personnelles
+> et sont exclus du dépôt via `.gitignore`.
+
+---
+
+## 🤝 Contribuer
+
+1. Forkez le projet
+2. Créez votre branche (`git checkout -b feature/ma-fonctionnalite`)
+3. Commitez (`git commit -m 'feat: description'`)
+4. Poussez (`git push origin feature/ma-fonctionnalite`)
+5. Ouvrez une Pull Request
+
+---
+
+<div align="center">
+
+**Faites croître votre richesse, pas votre stress.** 📈
+
+*Questions ou suggestions → [ouvrir une issue](https://github.com/JeremyGa2/TR-Portfolio-Tracker/issues)*
+
+</div>

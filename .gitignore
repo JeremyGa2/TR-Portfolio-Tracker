@@ -1,4 +1,4 @@
-# OS files
+# macOS
 .DS_Store
 .DS_Store?
 ._*
@@ -7,7 +7,11 @@
 ehthumbs.db
 Thumbs.db
 
-# IDE
+# Données financières personnelles (ne jamais commiter)
+Export TR/
+*.csv
+
+# Éditeurs
 .vscode/
 .idea/
 *.swp
@@ -15,8 +19,6 @@ Thumbs.db
 *~
 *.sublime-project
 *.sublime-workspace
-
-# Editor backup files
 *.bak
 
 # Logs
@@ -26,9 +28,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Misc
-.env
-.env.local
+# Node
 node_modules/
+
+# Build
 dist/
 build/
+
+# Env
+.env
+.env.local
