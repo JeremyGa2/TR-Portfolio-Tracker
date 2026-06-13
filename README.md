@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="https://upload.wikimedia.org/wikipedia/commons/thumb/1/1c/Trade_Republic_Logo.svg/200px-Trade_Republic_Logo.svg.png" width="60" alt="Trade Republic"/>
-
 # 📊 TR Portfolio Tracker
 
 ### *Votre portefeuille Trade Republic, visualisé comme jamais.*
