@@ -12,6 +12,7 @@ import {
   Check, RefreshCw, ArrowUpRight, ArrowDownRight, ChevronLeft, ChevronRight,
   DollarSign, Percent, Hash, PieChart as PieIcon, Flame, CalendarDays,
   Gift, Coins, Eye, EyeOff, Info, Sparkles, Wallet, CreditCard,
+, Gauge, Layers, Trophy,
 } from "lucide-react";
 
 /* PORTFOLIO TRACKER PRO v3 — Parser Trade Republic officiel */
@@ -21,6 +22,7 @@ const STORAGE_KEYS = {
   SECTOR_OVERRIDES: "tr_sector_overrides_v2",
   CURRENT_PRICES: "tr_current_prices_v2",
   HIDE_BALANCES: "tr_hide_balances_v1",
+  CALC_METHOD: "tr_calc_method_v1", // "PMP" (France, défaut) | "FIFO" (Allemagne)
 };
 
 const storage = {
@@ -234,8 +236,14 @@ function parseWorkbookTR(wb) {
   return txs;
 }
 
-// ═════ FIFO ENGINE ═════
-const computeFIFO = (transactions) => {
+// ═════ MOTEUR DE CALCUL DES PLUS-VALUES ═════
+// Deux méthodes fiscales :
+//  • "PMP"  (Prix Moyen Pondéré) — méthode FRANÇAISE (art. 150-0 D CGI) et celle affichée par Trade Republic.
+//    Le coût d'une vente = parts vendues × PMP. Le PMP ne change PAS lors d'une vente,
+//    il est recalculé à chaque achat : (coût restant + coût achat) / (parts restantes + parts achetées).
+//  • "FIFO" (First In First Out) — méthode ALLEMANDE. Chaque vente consomme les lots les plus anciens.
+// Les SAVEBACK et GIFT créent des parts : ils sont traités comme des achats (lots) dans les 2 méthodes.
+const computeFIFO = (transactions, method = "PMP") => {
   const tilgsByKey = {};
   for (const t of transactions) {
     if (t.kind === "TILG") {
@@ -243,21 +251,28 @@ const computeFIFO = (transactions) => {
       (tilgsByKey[k] = tilgsByKey[k] || []).push(t);
     }
   }
+  const BUY_KINDS = new Set(["BUY", "SAVEBACK", "GIFT"]);
   const byAsset = {};
   for (const t of transactions) {
-    if (t.kind !== "BUY" && t.kind !== "SELL" && t.kind !== "WARRANT_EXERCISE") continue;
+    if (!BUY_KINDS.has(t.kind) && t.kind !== "SELL" && t.kind !== "WARRANT_EXERCISE") continue;
+    // Un saveback/gift sans parts (cash pur) n'est pas un lot
+    if (BUY_KINDS.has(t.kind) && !(t.shares > 0)) continue;
     const key = t.symbol || t.name || "UNKNOWN";
     (byAsset[key] = byAsset[key] || []).push(t);
   }
-  const realizedTrades = [], openLots = [];
+  const realizedTrades = [], openLots = [], uncoveredSales = [];
   for (const [assetKey, txs] of Object.entries(byAsset)) {
     const sorted = [...txs].sort((a, b) => a.date - b.date);
-    let lots = [];
+    let lots = [];           // file de lots datés (sert au FIFO ET aux dates/holding en PMP)
+    let pmpShares = 0;       // parts en portefeuille (PMP)
+    let pmpCost = 0;         // coût total restant (PMP, frais d'acquisition inclus)
     for (const t of sorted) {
-      if (t.kind === "BUY") {
-        const totalCost = t.amount + t.fee + t.tax;
+      if (BUY_KINDS.has(t.kind)) {
+        const totalCost = t.amount + t.fee + t.tax; // frais d'acquisition inclus (règle fiscale FR et DE)
         const costPerShare = t.shares > 0 ? totalCost / t.shares : t.price;
         lots.push({ date: t.date, shares: t.shares, costPerShare, symbol: t.symbol, name: t.name, ref: t });
+        pmpShares += t.shares;
+        pmpCost += totalCost;
       } else {
         let proceedsTotal;
         if (t.kind === "WARRANT_EXERCISE") {
@@ -266,31 +281,65 @@ const computeFIFO = (transactions) => {
           proceedsTotal = m ? m.amount : 0;
         } else proceedsTotal = t.amount - t.fee - t.tax;
         const pps = t.shares > 0 ? proceedsTotal / t.shares : 0;
+        const ppsGross = t.shares > 0 ? t.amount / t.shares : 0; // prix d'exécution brut (celui affiché par TR)
+        const feePerShare = t.shares > 0 ? t.fee / t.shares : 0;
+        const taxPerShare = t.shares > 0 ? t.tax / t.shares : 0;
+        const pmpUnit = pmpShares > 1e-9 ? pmpCost / pmpShares : 0; // PMP au moment de la vente
         let rem = t.shares;
         while (rem > 1e-9 && lots.length) {
           const lot = lots[0];
           const used = Math.min(lot.shares, rem);
-          const cost = used * lot.costPerShare;
-          const proceeds = used * pps;
-          const pnl = proceeds - cost;
+          // Coût selon la méthode : PMP = prix moyen pondéré global ; FIFO = coût du lot consommé
+          const unitCost = method === "PMP" ? pmpUnit : lot.costPerShare;
+          const cost = used * unitCost;
+          const proceeds = used * pps;              // produit NET (frais/taxes de vente déduits)
+          const feeAlloc = used * feePerShare;      // frais réels imputés à cette fraction
+          const taxAlloc = used * taxPerShare;      // taxes prélevées à la source
+          const pnl = proceeds - cost;              // P&L NET de frais
           realizedTrades.push({
             symbol: t.symbol, isin: t.symbol, name: t.name || lot.name,
             buyDate: lot.date, sellDate: t.date, shares: used,
-            buyPrice: lot.costPerShare, sellPrice: pps,
+            buyPrice: unitCost, sellPrice: pps, sellPriceGross: ppsGross,
             cost, proceeds, pnl,
+            // Décomposition exacte pour l'affichage (évite tout double comptage) :
+            fee: feeAlloc, tax: taxAlloc,
+            pnlGross: pnl + feeAlloc + taxAlloc,     // P&L AVANT frais de vente
             pnlPct: cost > 0 ? (pnl / cost) * 100 : 0,
             holdingDays: Math.max(0, Math.round((t.date - lot.date) / 86400000)),
             kind: t.kind, assetClass: t.assetClass || "",
             accountType: t.accountType || "DEFAULT",
+            method,
           });
           lot.shares -= used; rem -= used;
           if (lot.shares < 1e-9) lots.shift();
         }
+        // ⚠ GARDE-FOU : parts vendues sans lot d'achat correspondant → export probablement incomplet.
+        // On les comptabilise quand même (coût inconnu = 0 → gain surestimé) et on AVERTIT l'utilisateur.
+        if (rem > 1e-9 && t.kind !== "WARRANT_EXERCISE") {
+          uncoveredSales.push({
+            symbol: t.symbol, name: t.name, sellDate: t.date,
+            sharesUncovered: rem, sharesSold: t.shares,
+            missingProceeds: rem * pps,
+          });
+        }
+        // Mise à jour du stock PMP : les parts vendues sortent au PMP (le PMP unitaire reste inchangé)
+        const sold = t.shares - rem;
+        if (method === "PMP") {
+          pmpCost = Math.max(0, pmpCost - sold * pmpUnit);
+        } else {
+          // en FIFO, le coût restant = somme des lots restants (recalcul propre)
+          pmpCost = lots.reduce((s, l) => s + l.shares * l.costPerShare, 0);
+        }
+        pmpShares = Math.max(0, pmpShares - sold);
       }
     }
-    for (const l of lots) if (l.shares > 1e-9) openLots.push({ ...l, assetKey });
+    // Lots ouverts : en PMP, le coût unitaire des parts restantes est le PMP final de l'actif
+    const finalPmpUnit = pmpShares > 1e-9 ? pmpCost / pmpShares : 0;
+    for (const l of lots) if (l.shares > 1e-9) {
+      openLots.push({ ...l, costPerShare: method === "PMP" ? finalPmpUnit : l.costPerShare, assetKey });
+    }
   }
-  return { realizedTrades, openLots };
+  return { realizedTrades, openLots, uncoveredSales };
 };
 
 // ═════ AGRÉGATIONS ═════
@@ -305,14 +354,16 @@ const consolidateTrades = (trades) => {
       groups[key] = {
         symbol: t.symbol, isin: t.symbol, name: t.name,
         sellDate: t.sellDate, buyDate: t.buyDate, // on prend la date d'achat du premier lot (le + ancien FIFO)
-        shares: 0, cost: 0, proceeds: 0, pnl: 0,
+        shares: 0, cost: 0, proceeds: 0, pnl: 0, fee: 0, tax: 0, pnlGross: 0,
         kind: t.kind, assetClass: t.assetClass || "",
         accountType: t.accountType || "DEFAULT",
         lotCount: 0, firstBuyDate: t.buyDate, lastBuyDate: t.buyDate,
+        method: t.method || "PMP", sellPriceGross: t.sellPriceGross || 0,
       };
     }
     const g = groups[key];
     g.shares += t.shares; g.cost += t.cost; g.proceeds += t.proceeds; g.pnl += t.pnl;
+    g.fee += (t.fee || 0); g.tax += (t.tax || 0); g.pnlGross += (t.pnlGross != null ? t.pnlGross : t.pnl);
     g.lotCount++;
     if (t.buyDate < g.firstBuyDate) g.firstBuyDate = t.buyDate;
     if (t.buyDate > g.lastBuyDate) g.lastBuyDate = t.buyDate;
@@ -538,6 +589,7 @@ export default function App() {
   const [sectorOverrides, setSectorOverrides] = useState({});
   const [currentPrices, setCurrentPrices] = useState({});
   const [hideBalances, setHideBalances] = useState(false);
+  const [calcMethod, setCalcMethod] = useState("PMP"); // "PMP" (France, défaut) | "FIFO" (Allemagne)
   const [activeTab, setActiveTab] = useState("dashboard");
   const [importMsg, setImportMsg] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -545,14 +597,16 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [tx, so, cp, hb] = await Promise.all([
+        const [tx, so, cp, hb, cm] = await Promise.all([
           storage.get(STORAGE_KEYS.TRANSACTIONS), storage.get(STORAGE_KEYS.SECTOR_OVERRIDES),
           storage.get(STORAGE_KEYS.CURRENT_PRICES), storage.get(STORAGE_KEYS.HIDE_BALANCES),
+          storage.get(STORAGE_KEYS.CALC_METHOD),
         ]);
         if (tx?.value) setTransactions(JSON.parse(tx.value).map(t => ({ ...t, date: new Date(t.date) })));
         if (so?.value) setSectorOverrides(JSON.parse(so.value));
         if (cp?.value) setCurrentPrices(JSON.parse(cp.value));
         if (hb?.value) setHideBalances(hb.value === "true");
+        if (cm?.value === "FIFO" || cm?.value === "PMP") setCalcMethod(cm.value);
       } catch (e) {}
       setLoaded(true);
     })();
@@ -561,6 +615,7 @@ export default function App() {
   const persistTx = useCallback(async (data) => { try { await storage.set(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(data.map(t => ({ ...t, date: t.date.toISOString() })))); } catch (e) {} }, []);
   const persistSectors = useCallback(async (d) => { try { await storage.set(STORAGE_KEYS.SECTOR_OVERRIDES, JSON.stringify(d)); } catch (e) {} }, []);
   const persistPrices = useCallback(async (d) => { try { await storage.set(STORAGE_KEYS.CURRENT_PRICES, JSON.stringify(d)); } catch (e) {} }, []);
+  const changeCalcMethod = useCallback(async (m) => { setCalcMethod(m); try { await storage.set(STORAGE_KEYS.CALC_METHOD, m); } catch (e) {} }, []);
 
   const handleFileImport = async (files) => {
     setImportMsg({ type: "loading", text: "Analyse des fichiers…" });
@@ -591,7 +646,8 @@ export default function App() {
   const sectorFn = useCallback((t) => detectSector(t, sectorOverrides), [sectorOverrides]);
 
   const derived = useMemo(() => {
-    const buysSells = transactions.filter(t => t.kind === "BUY" || t.kind === "SELL" || t.kind === "WARRANT_EXERCISE" || t.kind === "TILG");
+    // SAVEBACK et GIFT créent des parts : ils entrent dans le moteur de calcul comme des achats
+    const buysSells = transactions.filter(t => t.kind === "BUY" || t.kind === "SELL" || t.kind === "WARRANT_EXERCISE" || t.kind === "TILG" || ((t.kind === "SAVEBACK" || t.kind === "GIFT") && t.shares > 0));
     const dividends = transactions.filter(t => t.kind === "DIVIDEND").map(t => ({ date: t.date, gross: t.amount, tax: t.tax, net: t.amount - t.tax, symbol: t.symbol, name: t.name, accountType: t.accountType || "DEFAULT" }));
     const interests = transactions.filter(t => t.kind === "INTEREST").map(t => ({ date: t.date, gross: t.amount, tax: t.tax, net: t.amount - t.tax, accountType: t.accountType || "DEFAULT" }));
     const savebacks = transactions.filter(t => t.kind === "SAVEBACK").map(t => ({ date: t.date, amount: t.amount, name: t.name }));
@@ -600,7 +656,7 @@ export default function App() {
     const withdrawals = transactions.filter(t => t.kind === "WITHDRAWAL").map(t => ({ date: t.date, amount: t.amount }));
     const cardTx = transactions.filter(t => t.kind === "CARD").map(t => ({ date: t.date, amount: t.amount, amountRaw: t.amountRaw, name: t.name }));
 
-    const { realizedTrades, openLots } = computeFIFO(buysSells);
+    const { realizedTrades, openLots, uncoveredSales } = computeFIFO(buysSells, calcMethod);
     const consolidatedTrades = consolidateTrades(realizedTrades); // 1 ligne par vente réelle (pas par lot FIFO)
     const stats = computeStats(realizedTrades, dividends, interests, savebacks, gifts, consolidatedTrades);
     const bySector = aggregateBySector(realizedTrades, openLots, currentPrices, sectorFn);
@@ -944,8 +1000,8 @@ export default function App() {
     let ci = 0, cr = 0, cd = 0;
     const curveSeries = events.map(e => { ci += e.invested; cr += e.realized; cd += e.divInt; return { date: fmtDate(e.date), invested: ci, realized: cr, divInt: cd }; });
 
-    return { transactions, orderAnnotations, dividends, interests, savebacks, gifts, deposits, withdrawals, cardTx, realizedTrades, consolidatedTrades, openLots, stats, bySector, byAsset, openInvested, openValue, unrealizedPnL, totalDeposits, totalWithdrawals, totalCardSpend, curveSeries, feesEstimation, monthlyArr, weeklyArr, lifetimeCoverage, lifetimeSurplus, cardCategories, cardSpendNet, totalGains, taxation, behaviorStats, xirr, dailyGains, records, healthScore, healthComponents, monthComparison, runwayMonths, avgMonthlySpendAllTime };
-  }, [transactions, currentPrices, sectorFn]);
+    return { transactions, orderAnnotations, dividends, interests, savebacks, gifts, deposits, withdrawals, cardTx, realizedTrades, consolidatedTrades, openLots, stats, bySector, byAsset, openInvested, openValue, unrealizedPnL, totalDeposits, totalWithdrawals, totalCardSpend, curveSeries, feesEstimation, monthlyArr, weeklyArr, lifetimeCoverage, lifetimeSurplus, cardCategories, cardSpendNet, totalGains, taxation, behaviorStats, xirr, dailyGains, records, healthScore, healthComponents, monthComparison, runwayMonths, avgMonthlySpendAllTime, calcMethod, uncoveredSales };
+  }, [transactions, currentPrices, sectorFn, calcMethod]);
 
   if (!loaded) return <div className="min-h-screen bg-slate-950 flex items-center justify-center"><div className="text-slate-400 font-mono text-sm animate-pulse">Initialisation du terminal…</div></div>;
 
@@ -1012,7 +1068,7 @@ export default function App() {
             {activeTab === "periods" && <PeriodsView d={derived} sectorFn={sectorFn} hide={hideBalances} />}
             {activeTab === "analyses" && <AnalysesView d={derived} sectorFn={sectorFn} hide={hideBalances} />}
             {activeTab === "transactions" && <TransactionsView d={derived} sectorFn={sectorFn} hide={hideBalances} />}
-            {activeTab === "settings" && <Settings onImport={handleFileImport} transactions={transactions} onClear={() => { setTransactions([]); persistTx([]); }} sectorOverrides={sectorOverrides} onSectorOverride={(s, v) => { const n = { ...sectorOverrides }; if (v) n[s] = v; else delete n[s]; setSectorOverrides(n); persistSectors(n); }} derived={derived} sectorFn={sectorFn} />}
+            {activeTab === "settings" && <Settings onImport={handleFileImport} transactions={transactions} onClear={() => { setTransactions([]); persistTx([]); }} sectorOverrides={sectorOverrides} onSectorOverride={(s, v) => { const n = { ...sectorOverrides }; if (v) n[s] = v; else delete n[s]; setSectorOverrides(n); persistSectors(n); }} derived={derived} sectorFn={sectorFn} calcMethod={calcMethod} onCalcMethod={changeCalcMethod} />}
           </>
         )}
       </main>
@@ -1049,10 +1105,13 @@ function Dashboard({ d, sectorFn, hide, prices, onPriceChange }) {
   // ═════ CALCUL BRUT / FRAIS / TAXE / NET ═════
   // Niveau 1 : BRUT TOTAL = P&L réalisée + P&L latente + Dividendes + Intérêts + Saveback + Gifts
   const revenus = stats.totalDividends + stats.totalInterests + stats.totalSavebacks + stats.totalGifts;
-  const gainTotalBrut = stats.totalPnL + unrealizedPnL + revenus;
-  // Niveau 2 : APRÈS FRAIS = Brut − frais courtage estimés
+  // ⚠ Les frais DÉCLARÉS dans l'export sont déjà intégrés au P&L (inclus au coût d'achat, déduits du produit de vente).
+  // Le "Brut" est donc reconstitué en les rajoutant, et seuls les frais NON déclarés (estimés) réduisent encore le net.
+  const feesDeclared = feesEstimation?.totalDeclared || 0;
+  const feesHidden = feesEstimation?.hiddenFees || 0;
   const totalFeesEst = feesEstimation?.totalEstimated || 0;
-  const gainAfterFees = gainTotalBrut - totalFeesEst;
+  const gainTotalBrut = stats.totalPnL + unrealizedPnL + revenus + feesDeclared;
+  const gainAfterFees = gainTotalBrut - totalFeesEst; // = P&L − frais non déclarés uniquement
   // Niveau 3 : APRÈS IMPÔTS = Après-frais − taxe CTO 31,4% sur les gains imposables CTO
   const taxCTO = taxation?.taxCTOEstimated || 0;
   const gainNet = gainAfterFees - taxCTO;
@@ -1087,6 +1146,42 @@ function Dashboard({ d, sectorFn, hide, prices, onPriceChange }) {
 
   return (
     <div className="space-y-6">
+      {/* ═══════ ⚠ STOCKAGE INDISPONIBLE (fichier ouvert en local / navigation privée) ═══════ */}
+      {typeof window !== "undefined" && window.__storageIsTemporary && (
+        <div className="bg-rose-500/10 border border-rose-500/40 rounded-xl p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+          <div className="text-xs text-rose-100 space-y-1">
+            <div className="font-bold text-rose-200 text-sm">⚠ Sauvegarde désactivée par le navigateur</div>
+            <div className="text-rose-200/80">
+              Tes données resteront le temps de cette session mais <strong>seront perdues à la fermeture</strong>.
+              C'est le cas quand le fichier est ouvert depuis un aperçu ou en navigation privée.
+            </div>
+            <div className="text-rose-200/70">→ Ouvre l'app dans <strong>Safari</strong> (Partager → « Ouvrir dans Safari ») ou depuis ton lien GitHub pour retrouver la sauvegarde automatique.</div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ ⚠ ALERTE FIABILITÉ : export incomplet détecté ═══════ */}
+      {d.uncoveredSales && d.uncoveredSales.length > 0 && (
+        <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+          <div className="text-xs text-amber-100 space-y-1.5 min-w-0">
+            <div className="font-bold text-amber-200 text-sm">⚠ Ton export Trade Republic semble incomplet — les gains affichés peuvent être faux</div>
+            <div className="text-amber-200/80">
+              {d.uncoveredSales.length} vente{d.uncoveredSales.length > 1 ? "s" : ""} porte{d.uncoveredSales.length > 1 ? "nt" : ""} sur des parts <strong>sans achat correspondant</strong> dans les données importées.
+              Le prix de revient de ces parts est inconnu, donc le calcul du gain (et le PMP de tout l'actif) est faussé — c'est la cause n°1 d'écart avec l'app Trade Republic.
+            </div>
+            <div className="font-mono text-[10px] text-amber-300/90 space-y-0.5 pt-1">
+              {d.uncoveredSales.slice(0, 5).map((u, i) => (
+                <div key={i}>• {u.name || u.symbol} — {fmtDateShort(u.sellDate)} : {fmtNum(u.sharesUncovered, 4)} / {fmtNum(u.sharesSold, 4)} parts sans lot d'achat ({mask(fmtEUR(u.missingProceeds, 0), hide)} de produit)</div>
+              ))}
+              {d.uncoveredSales.length > 5 && <div>… et {d.uncoveredSales.length - 5} autre(s)</div>}
+            </div>
+            <div className="text-amber-200/70 pt-1">→ Réimporte un export couvrant <strong>tout ton historique depuis l'ouverture du compte</strong> (Trade Republic → Profil → Activité → Exporter, sans filtre de date).</div>
+          </div>
+        </div>
+      )}
+
       {/* ═══════ HERO PRINCIPAL ═══════ */}
       <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-900 via-slate-900 to-slate-950">
         <div className="absolute -top-40 -right-40 w-96 h-96 rounded-full opacity-10 blur-3xl" style={{ background: gainNet >= 0 ? "#10b981" : "#f43f5e" }} />
@@ -1449,16 +1544,16 @@ const GainsRecents = ({ d, hide }) => {
     const divs = divsList.reduce((s, x) => s + x.net, 0);
     const ints = intsList.reduce((s, x) => s + x.net, 0);
     const svb = svbList.reduce((s, x) => s + x.amount, 0);
-    const realizedBrut = trades.reduce((s, t) => s + t.pnl, 0);
-    // Frais estimés sur les VENTES de cette période (1€/vente spot)
-    const spotSells = trades.length;
-    const feesOnSells = spotSells * 1.0;
-    const realizedAfterFees = realizedBrut - feesOnSells;
-    // TAXE CTO 31,4% sur P&L positive + dividendes + intérêts (PEA exonéré)
+    // ⚠ IMPORTANT : t.pnl est DÉJÀ net des frais et taxes de vente (proceeds = montant − frais − taxes).
+    // On reconstitue donc le brut à partir de pnlGross, et on affiche les frais RÉELS de l'export
+    // (jamais une estimation forfaitaire, sinon les frais seraient comptés deux fois).
+    const realizedBrut = trades.reduce((s, t) => s + (t.pnlGross != null ? t.pnlGross : t.pnl), 0);
+    const feesOnSells = trades.reduce((s, t) => s + (t.fee || 0) + (t.tax || 0), 0);
+    const realizedAfterFees = trades.reduce((s, t) => s + t.pnl, 0); // = realizedBrut − feesOnSells
+    // TAXE CTO 31,4% sur P&L positive (nette de frais) + dividendes + intérêts (PEA exonéré)
     const TAX = 0.314;
     const ctoTrades = tradesRaw.filter(t => t.accountType !== "PEA");
-    const ctoPnL = ctoTrades.reduce((s, t) => s + t.pnl, 0);
-    const ctoPnLAfterFees = ctoPnL - feesOnSells * (ctoTrades.length / Math.max(1, tradesRaw.length)); // au prorata
+    const ctoPnLAfterFees = ctoTrades.reduce((s, t) => s + t.pnl, 0);
     const ctoDivs = divsList.filter(d => d.accountType !== "PEA").reduce((s, x) => s + x.net, 0);
     const ctoInts = intsList.filter(i => i.accountType !== "PEA").reduce((s, x) => s + x.net, 0);
     const taxableCTO = Math.max(0, ctoPnLAfterFees) + Math.max(0, ctoDivs) + Math.max(0, ctoInts);
@@ -1567,8 +1662,10 @@ const GainsDetailModal = ({ data, onClose, hide }) => {
               </div>
               <div className="space-y-1.5">
                 {[...trades].sort((a, b) => b.pnl - a.pnl).map((t, i) => {
-                  const feeShare = 1; // 1€ par vente
-                  const afterFees = t.pnl - feeShare;
+                  // t.pnl est DÉJÀ net des frais réels → on ne redéduit rien.
+                  const feeShare = (t.fee || 0) + (t.tax || 0);
+                  const pnlBrut = t.pnlGross != null ? t.pnlGross : t.pnl + feeShare;
+                  const afterFees = t.pnl;
                   // Taxe CTO : seulement si gain positif sur compte CTO (pas PEA)
                   const isPEA = t.accountType === "PEA";
                   const taxOnTrade = (afterFees > 0 && !isPEA) ? afterFees * 0.314 : 0;
@@ -1584,10 +1681,11 @@ const GainsDetailModal = ({ data, onClose, hide }) => {
                           <span>{fmtNum(t.shares, 4)} parts</span>
                           <span>·</span>
                           <span>{t.holdingDays}j détenus</span>
-                          {t.lotCount > 1 && <><span>·</span><span className="text-cyan-400">{t.lotCount} lots FIFO</span></>}
+                          <span>·</span>
+                          <span className="text-cyan-400">{t.method === "FIFO" ? `${t.lotCount} lots FIFO` : "coût PMP"}</span>
                         </div>
                         <div className="text-[10px] text-slate-600 font-mono mt-0.5">
-                          Acheté {fmtEUR(t.buyPrice, 4)} → Vendu {fmtEUR(t.sellPrice, 4)}
+                          {t.method === "FIFO" ? "Acheté" : "PMP"} {fmtEUR(t.buyPrice, 4)} → Exécuté {fmtEUR(t.sellPriceGross || t.sellPrice, 4)}{t.sellPriceGross > 0 && Math.abs(t.sellPriceGross - t.sellPrice) > 0.0001 ? ` (net ${fmtEUR(t.sellPrice, 4)})` : ""}
                         </div>
                       </div>
                       <div className="text-right shrink-0">
@@ -2162,7 +2260,7 @@ function Positions({ d, prices, onPriceChange, sectorFn, hide }) {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <KPICard label="Positions ouvertes" value={positions.length} icon={Briefcase} accent="cyan" sub={`${positions.reduce((s, p) => s + p.lotCount, 0)} lots FIFO`} />
+        <KPICard label="Positions ouvertes" value={positions.length} icon={Briefcase} accent="cyan" sub={`${positions.reduce((s, p) => s + p.lotCount, 0)} lots d'achat`} />
         <KPICard label="Capital investi" value={mask(fmtEUR(totalInvested, 0), hide)} icon={DollarSign} accent="blue" />
         <KPICard label="Valeur estimée" value={mask(fmtEUR(totalValue, 0), hide)} sub={missingPx > 0 ? `${missingPx} cours à saisir` : "cours complets"} subClass={missingPx > 0 ? "text-amber-400" : "text-emerald-400"} icon={Briefcase} accent="emerald" />
         <KPICard label="P&L latente totale" value={mask(fmtEUR(totalPnL, 0), hide)} sub={fmtPct(totalInvested > 0 ? (totalPnL / totalInvested) * 100 : 0)} subClass={classFor(totalPnL)} icon={TrendingUp} accent={totalPnL >= 0 ? "emerald" : "rose"} big />
@@ -2591,7 +2689,7 @@ function AnalysesView({ d, sectorFn, hide }) {
     <div className="space-y-4">
       {/* KPIs en haut, toujours visibles */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-        <KPICard label="Total ventes" value={stats.count} icon={Hash} accent="cyan" sub={stats.lotCount ? `${stats.lotCount} lots FIFO` : ""} />
+        <KPICard label="Total ventes" value={stats.count} icon={Hash} accent="cyan" sub={d.calcMethod === "FIFO" ? (stats.lotCount ? `${stats.lotCount} lots FIFO` : "") : "méthode PMP 🇫🇷"} />
         <KPICard label="Win rate" value={stats.count ? stats.winRate.toFixed(1) + "%" : "—"} icon={Target} accent={stats.winRate >= 50 ? "emerald" : "rose"} sub={stats.count ? `${stats.winCount}W · ${stats.lossCount}L` : ""} />
         <KPICard label="Profit factor" value={stats.profitFactor === Infinity ? "∞" : stats.profitFactor.toFixed(2)} icon={Zap} accent={stats.profitFactor >= 1.5 ? "emerald" : stats.profitFactor >= 1 ? "amber" : "rose"} sub="> 1,5 = excellent" />
         <KPICard label="Expectancy" value={stats.count ? mask(fmtEUR(stats.totalPnL / stats.count, 0), hide) : "—"} subClass={classFor(stats.totalPnL)} icon={Flame} accent="amber" sub="par vente" />
@@ -3260,7 +3358,7 @@ const TransactionDetailModal = ({ tx, sector, onClose, hide }) => {
 
 // ═══════════════ SETTINGS ═══════════════
 
-function Settings({ onImport, transactions, onClear, sectorOverrides, onSectorOverride, derived, sectorFn }) {
+function Settings({ onImport, transactions, onClear, sectorOverrides, onSectorOverride, derived, sectorFn, calcMethod, onCalcMethod }) {
   const inputRef = useRef(null);
   const [confirmClear, setConfirmClear] = useState(false);
 
@@ -3291,6 +3389,38 @@ function Settings({ onImport, transactions, onClear, sectorOverrides, onSectorOv
 
   return (
     <div className="space-y-6">
+      {/* ═══ MÉTHODE DE CALCUL DES PLUS-VALUES ═══ */}
+      <Card className="border-cyan-500/30">
+        <SectionTitle icon={Target} subtitle="Comment le prix de revient de tes ventes est calculé">🧮 Méthode de calcul des plus-values</SectionTitle>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+          <button onClick={() => onCalcMethod && onCalcMethod("PMP")}
+            className={`text-left p-4 rounded-xl border-2 transition-colors ${calcMethod === "PMP" ? "border-cyan-400 bg-cyan-500/10" : "border-slate-700 bg-slate-950 hover:border-slate-500"}`}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="font-bold text-sm text-slate-100">🇫🇷 PMP — Prix Moyen Pondéré</div>
+              {calcMethod === "PMP" && <span className="text-[10px] font-bold text-cyan-300 bg-cyan-500/20 px-2 py-0.5 rounded">ACTIF</span>}
+            </div>
+            <div className="text-xs text-slate-400 leading-relaxed">
+              <strong className="text-slate-200">Recommandé.</strong> Méthode fiscale française (art. 150-0 D CGI) et celle affichée par <strong className="text-slate-200">Trade Republic</strong>.
+              Le coût d'une vente = parts × prix moyen de TOUS tes achats. Le prix moyen ne change pas quand tu vends.
+            </div>
+          </button>
+          <button onClick={() => onCalcMethod && onCalcMethod("FIFO")}
+            className={`text-left p-4 rounded-xl border-2 transition-colors ${calcMethod === "FIFO" ? "border-cyan-400 bg-cyan-500/10" : "border-slate-700 bg-slate-950 hover:border-slate-500"}`}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="font-bold text-sm text-slate-100">🇩🇪 FIFO — Premier entré, premier sorti</div>
+              {calcMethod === "FIFO" && <span className="text-[10px] font-bold text-cyan-300 bg-cyan-500/20 px-2 py-0.5 rounded">ACTIF</span>}
+            </div>
+            <div className="text-xs text-slate-400 leading-relaxed">
+              Méthode allemande. Chaque vente consomme d'abord tes lots les plus anciens.
+              Utile pour comparer, mais donne des gains <strong className="text-slate-200">par vente différents de l'app TR</strong> (le total sur la vie du titre reste identique).
+            </div>
+          </button>
+        </div>
+        <div className="text-[11px] text-slate-500 bg-slate-950 rounded-lg p-3 border border-slate-800">
+          💡 Si tes gains diffèrent de l'app Trade Republic : (1) vérifie que <strong className="text-slate-300">PMP</strong> est actif, (2) assure-toi d'avoir importé un export couvrant <strong className="text-slate-300">tout ton historique</strong> — un export partiel fausse le prix moyen car les anciens achats manquent.
+        </div>
+      </Card>
+
       <Card>
         <SectionTitle icon={Upload}>Import</SectionTitle>
         <div onClick={() => inputRef.current?.click()} className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center cursor-pointer hover:border-cyan-500 hover:bg-cyan-500/5 transition-colors">
