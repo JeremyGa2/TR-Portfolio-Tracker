@@ -989,6 +989,137 @@ export default function App() {
       deltaCoverage: curMonth && prevMonth ? curMonth.coverage - prevMonth.coverage : null,
     };
 
+    // ═════ 🔍 AUDIT DES CALCULS ═════
+    // Recalcule les résultats par des chemins INDÉPENDANTS du moteur principal.
+    // Objectif : détecter une erreur de calcul ou une donnée d'entrée douteuse
+    // plutôt que d'afficher un chiffre faux avec assurance.
+    const auditReport = (() => {
+      const checks = [];
+      const EPS = 0.01; // tolérance 1 centime
+      const add = (id, label, status, detail, rows) => checks.push({ id, label, status, detail, rows: rows || [] });
+
+      // ── 1. INVARIANT FONDAMENTAL ──
+      // Sur un actif totalement soldé, le gain cumulé DOIT valoir Σ(produits) − Σ(coûts),
+      // indépendamment de la méthode (PMP ou FIFO ne changent que la répartition).
+      const byAssetTx = {};
+      for (const t of buysSells) {
+        const k = t.symbol || t.name;
+        if (!k) continue;
+        (byAssetTx[k] = byAssetTx[k] || []).push(t);
+      }
+      const invariantRows = [];
+      let maxDev = 0;
+      for (const [k, txs] of Object.entries(byAssetTx)) {
+        let bought = 0, sold = 0, costIn = 0, proceedsOut = 0;
+        for (const t of txs) {
+          if (t.kind === "BUY" || t.kind === "SAVEBACK" || t.kind === "GIFT") { bought += t.shares; costIn += t.amount + t.fee + t.tax; }
+          else if (t.kind === "SELL") { sold += t.shares; proceedsOut += t.amount - t.fee - t.tax; }
+        }
+        if (bought < 1e-9 || Math.abs(bought - sold) > 1e-6) continue; // position non soldée
+        const expected = proceedsOut - costIn;
+        const actual = realizedTrades.filter(r => (r.symbol || r.name) === k).reduce((s, r) => s + r.pnl, 0);
+        const dev = Math.abs(expected - actual);
+        if (dev > maxDev) maxDev = dev;
+        if (dev > EPS) invariantRows.push({ label: txs[0].name || k, detail: `attendu ${expected.toFixed(2)} € · calculé ${actual.toFixed(2)} € · écart ${dev.toFixed(2)} €` });
+      }
+      add("invariant", "Cohérence des positions soldées", invariantRows.length ? "error" : "ok",
+        invariantRows.length
+          ? `${invariantRows.length} actif(s) soldé(s) dont le gain cumulé ne correspond pas à (ventes − achats).`
+          : `Sur chaque actif entièrement vendu, le gain cumulé égale bien Σ ventes − Σ achats (écart max ${maxDev.toFixed(4)} €).`,
+        invariantRows);
+
+      // ── 2. IDENTITÉ BRUT − FRAIS = NET ──
+      let feeDev = 0;
+      for (const r of realizedTrades) {
+        const g = r.pnlGross != null ? r.pnlGross : r.pnl;
+        feeDev = Math.max(feeDev, Math.abs(g - (r.fee || 0) - (r.tax || 0) - r.pnl));
+      }
+      add("fees", "Frais comptés une seule fois", feeDev > EPS ? "error" : "ok",
+        feeDev > EPS
+          ? `Incohérence détectée (écart max ${feeDev.toFixed(4)} €) : les frais seraient comptés deux fois.`
+          : `Pour chaque vente, gain brut − frais = gain net (écart max ${feeDev.toFixed(4)} €).`);
+
+      // ── 3. VENTES NON COUVERTES (export incomplet) ──
+      add("uncovered", "Couverture des ventes par des achats", uncoveredSales.length ? "error" : "ok",
+        uncoveredSales.length
+          ? `${uncoveredSales.length} vente(s) portent sur des parts sans achat correspondant : le prix de revient est inconnu, les gains affichés sont SURESTIMÉS.`
+          : "Chaque part vendue a bien un achat correspondant dans les données.",
+        uncoveredSales.map(u => ({ label: u.name || u.symbol, detail: `${fmtNum(u.sharesUncovered, 4)} / ${fmtNum(u.sharesSold, 4)} parts sans lot d'achat` })));
+
+      // ── 4. DEVISES ──
+      // Les montants sont additionnés tels quels : une ligne non-EUR fausserait tout.
+      const cur = {};
+      for (const t of transactions) { const c = (t.currency || "EUR").toUpperCase(); cur[c] = (cur[c] || 0) + 1; }
+      const nonEur = Object.entries(cur).filter(([c]) => c !== "EUR");
+      add("currency", "Devise unique (EUR)", nonEur.length ? "warn" : "ok",
+        nonEur.length
+          ? `Des lignes ne sont pas en euros. Les montants sont additionnés sans conversion : ces lignes faussent les totaux.`
+          : `Toutes les transactions sont libellées en euros (${cur.EUR || 0} lignes).`,
+        nonEur.map(([c, n]) => ({ label: c, detail: `${n} transaction(s)` })));
+
+      // ── 5. DOUBLONS D'IDENTIFIANT ──
+      const seen = {}, dups = [];
+      for (const t of transactions) {
+        const id = t.txId;
+        if (!id) continue;
+        if (seen[id]) dups.push({ label: t.name || t.kind, detail: `${fmtDate(t.date)} · identifiant ${String(id).slice(0, 24)}` });
+        seen[id] = true;
+      }
+      add("dups", "Absence de doublons", dups.length ? "warn" : "ok",
+        dups.length ? `${dups.length} transaction(s) partagent un identifiant : risque de double comptage.` : "Aucun identifiant de transaction en double.",
+        dups.slice(0, 10));
+
+      // ── 6. POSITIONS NÉGATIVES ──
+      const negRows = [];
+      for (const [k, txs] of Object.entries(byAssetTx)) {
+        let bal = 0;
+        for (const t of [...txs].sort((a, b) => a.date - b.date)) {
+          if (t.kind === "BUY" || t.kind === "SAVEBACK" || t.kind === "GIFT") bal += t.shares;
+          else if (t.kind === "SELL") bal -= t.shares;
+          if (bal < -1e-6) { negRows.push({ label: txs[0].name || k, detail: `solde négatif au ${fmtDate(t.date)} (${fmtNum(bal, 4)} parts)` }); break; }
+        }
+      }
+      add("negative", "Aucun solde de parts négatif", negRows.length ? "error" : "ok",
+        negRows.length ? `${negRows.length} actif(s) passent en parts négatives : il manque des achats.` : "Le solde de parts reste positif sur tous les actifs.",
+        negRows);
+
+      // ── 7. DATES ABERRANTES ──
+      const now = new Date(), y2000 = new Date("2000-01-01");
+      const badDates = transactions.filter(t => !(t.date instanceof Date) || isNaN(t.date) || t.date > new Date(now.getTime() + 86400000) || t.date < y2000);
+      add("dates", "Dates plausibles", badDates.length ? "warn" : "ok",
+        badDates.length ? `${badDates.length} transaction(s) ont une date future ou invalide.` : "Toutes les dates sont dans une plage plausible.",
+        badDates.slice(0, 8).map(t => ({ label: t.name || t.kind, detail: String(t.date) })));
+
+      // ── 8. FRAIS ANORMAUX ──
+      const oddFees = transactions.filter(t => (t.kind === "BUY" || t.kind === "SELL") && t.amount > 0 && t.fee > Math.max(5, t.amount * 0.05));
+      add("oddfees", "Frais dans une plage normale", oddFees.length ? "warn" : "ok",
+        oddFees.length ? `${oddFees.length} ordre(s) avec des frais supérieurs à 5 % du montant : à vérifier dans l'export.` : "Aucun frais anormalement élevé.",
+        oddFees.slice(0, 8).map(t => ({ label: t.name || t.symbol, detail: `${fmtEUR(t.fee)} de frais sur ${fmtEUR(t.amount)}` })));
+
+      // ── 9. PRIX MANQUANTS (P&L latent incomplet) ──
+      // Renseigné côté composant : on expose seulement le nombre de positions ouvertes.
+      const openBySymbol = {};
+      for (const l of openLots) { const k = l.symbol || l.name; openBySymbol[k] = (openBySymbol[k] || 0) + l.shares; }
+      const openCount = Object.values(openBySymbol).filter(v => v > 1e-9).length;
+
+      // ── 10. RÉCONCILIATION DE TRÉSORERIE ──
+      // Somme algébrique de tous les flux : doit correspondre au solde théorique du compte.
+      let flow = 0;
+      for (const t of transactions) {
+        if (t.kind === "DEPOSIT") flow += t.amount;
+        else if (t.kind === "WITHDRAWAL") flow -= t.amount;
+        else if (t.kind === "BUY") flow -= (t.amount + t.fee + t.tax);
+        else if (t.kind === "SELL") flow += (t.amount - t.fee - t.tax);
+        else if (t.kind === "DIVIDEND" || t.kind === "INTEREST") flow += (t.amount - t.tax);
+        else if (t.kind === "CARD") flow -= t.amount;
+        else if (t.kind === "CARD_REFUND") flow += t.amount;
+      }
+
+      const errors = checks.filter(c => c.status === "error").length;
+      const warns = checks.filter(c => c.status === "warn").length;
+      return { checks, errors, warns, cashFlow: flow, openCount, tradeCount: realizedTrades.length };
+    })();
+
     // Courbes cumulées
     const events = [];
     for (const t of transactions) {
@@ -1000,7 +1131,7 @@ export default function App() {
     let ci = 0, cr = 0, cd = 0;
     const curveSeries = events.map(e => { ci += e.invested; cr += e.realized; cd += e.divInt; return { date: fmtDate(e.date), invested: ci, realized: cr, divInt: cd }; });
 
-    return { transactions, orderAnnotations, dividends, interests, savebacks, gifts, deposits, withdrawals, cardTx, realizedTrades, consolidatedTrades, openLots, stats, bySector, byAsset, openInvested, openValue, unrealizedPnL, totalDeposits, totalWithdrawals, totalCardSpend, curveSeries, feesEstimation, monthlyArr, weeklyArr, lifetimeCoverage, lifetimeSurplus, cardCategories, cardSpendNet, totalGains, taxation, behaviorStats, xirr, dailyGains, records, healthScore, healthComponents, monthComparison, runwayMonths, avgMonthlySpendAllTime, calcMethod, uncoveredSales };
+    return { transactions, orderAnnotations, dividends, interests, savebacks, gifts, deposits, withdrawals, cardTx, realizedTrades, consolidatedTrades, openLots, stats, bySector, byAsset, openInvested, openValue, unrealizedPnL, totalDeposits, totalWithdrawals, totalCardSpend, curveSeries, feesEstimation, monthlyArr, weeklyArr, lifetimeCoverage, lifetimeSurplus, cardCategories, cardSpendNet, totalGains, taxation, behaviorStats, xirr, dailyGains, records, healthScore, healthComponents, monthComparison, runwayMonths, avgMonthlySpendAllTime, calcMethod, uncoveredSales, auditReport };
   }, [transactions, currentPrices, sectorFn, calcMethod]);
 
   if (!loaded) return <div className="min-h-screen bg-slate-950 flex items-center justify-center"><div className="text-slate-400 font-mono text-sm animate-pulse">Initialisation du terminal…</div></div>;
@@ -1607,6 +1738,14 @@ const GainsRecents = ({ d, hide }) => {
   );
 };
 
+// Ligne d'un calcul détaillé (libellé à gauche, valeur alignée à droite)
+const CalcRow = ({ label, value, strong, neg, accent }) => (
+  <div className={`flex justify-between gap-3 ${strong ? "pt-1 border-t border-slate-800" : ""}`}>
+    <span className={strong ? "text-slate-300 font-semibold" : "text-slate-500"}>{label}</span>
+    <span className={`tabular-nums shrink-0 ${accent === "pos" ? "text-emerald-400 font-bold" : accent === "neg" ? "text-rose-400 font-bold" : neg ? "text-amber-400" : strong ? "text-slate-100 font-bold" : "text-slate-300"}`}>{value}</span>
+  </div>
+);
+
 // Modal de détail des gains pour une période donnée
 const GainsDetailModal = ({ data, onClose, hide }) => {
   // Empêche le scroll body en arrière-plan
@@ -1671,31 +1810,59 @@ const GainsDetailModal = ({ data, onClose, hide }) => {
                   const taxOnTrade = (afterFees > 0 && !isPEA) ? afterFees * 0.314 : 0;
                   const pnlNetReal = afterFees - taxOnTrade;
                   return (
-                    <div key={i} className={`flex items-center gap-3 p-3 rounded-lg border bg-slate-950/60 ${t.pnl >= 0 ? "border-emerald-500/20" : "border-rose-500/20"}`}>
-                      <div className={`w-1 h-12 rounded-full shrink-0 ${t.pnl >= 0 ? "bg-emerald-500" : "bg-rose-500"}`} />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-semibold truncate">{t.name || t.symbol}</div>
-                        <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono flex-wrap">
-                          <span>{fmtDateShort(t.sellDate)}</span>
-                          <span>·</span>
-                          <span>{fmtNum(t.shares, 4)} parts</span>
-                          <span>·</span>
-                          <span>{t.holdingDays}j détenus</span>
-                          <span>·</span>
-                          <span className="text-cyan-400">{t.method === "FIFO" ? `${t.lotCount} lots FIFO` : "coût PMP"}</span>
+                    <details key={i} className={`group rounded-lg border bg-slate-950/60 ${t.pnl >= 0 ? "border-emerald-500/20" : "border-rose-500/20"}`}>
+                      <summary className="flex items-center gap-3 p-3 cursor-pointer list-none">
+                        <div className={`w-1 h-12 rounded-full shrink-0 ${t.pnl >= 0 ? "bg-emerald-500" : "bg-rose-500"}`} />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-semibold truncate">{t.name || t.symbol}</div>
+                          <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono flex-wrap">
+                            <span>{fmtDateShort(t.sellDate)}</span>
+                            <span>·</span>
+                            <span>{fmtNum(t.shares, 4)} parts</span>
+                            <span>·</span>
+                            <span>{t.holdingDays}j détenus</span>
+                            <span>·</span>
+                            <span className="text-cyan-400">{t.method === "FIFO" ? `${t.lotCount} lots FIFO` : "coût PMP"}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-600 font-mono mt-0.5">
+                            {t.method === "FIFO" ? "Acheté" : "PMP"} {fmtEUR(t.buyPrice, 4)} → Exécuté {fmtEUR(t.sellPriceGross || t.sellPrice, 4)}{t.sellPriceGross > 0 && Math.abs(t.sellPriceGross - t.sellPrice) > 0.0001 ? ` (net ${fmtEUR(t.sellPrice, 4)})` : ""}
+                          </div>
+                          <div className="text-[9px] text-cyan-400/70 font-mono mt-1 group-open:hidden">▸ voir le calcul détaillé</div>
                         </div>
-                        <div className="text-[10px] text-slate-600 font-mono mt-0.5">
-                          {t.method === "FIFO" ? "Acheté" : "PMP"} {fmtEUR(t.buyPrice, 4)} → Exécuté {fmtEUR(t.sellPriceGross || t.sellPrice, 4)}{t.sellPriceGross > 0 && Math.abs(t.sellPriceGross - t.sellPrice) > 0.0001 ? ` (net ${fmtEUR(t.sellPrice, 4)})` : ""}
+                        <div className="text-right shrink-0">
+                          <div className={`text-sm font-mono font-bold tabular-nums ${classFor(t.pnl)}`}>
+                            {mask((t.pnl >= 0 ? "+" : "") + fmtEUR(t.pnl, 2).replace("+", ""), hide)}
+                          </div>
+                          <div className={`text-[9px] font-mono ${classFor(t.pnl)}`}>{fmtPct(t.pnlPct, 1)} brut</div>
+                          <div className="text-[9px] font-mono text-slate-500 mt-0.5">net {fmtEUR(pnlNetReal, 2)}{isPEA && " (PEA)"}</div>
+                        </div>
+                      </summary>
+                      {/* ═══ CALCUL DÉTAILLÉ — vérifiable ligne à ligne ═══ */}
+                      <div className="px-3 pb-3 pt-1 border-t border-slate-800/60 mt-1">
+                        <div className="font-mono text-[10px] space-y-1 bg-slate-950 rounded-lg p-3 border border-slate-800">
+                          <div className="text-slate-500 uppercase tracking-widest text-[9px] mb-2">Comment ce montant est obtenu</div>
+                          <CalcRow label={`Parts vendues`} value={fmtNum(t.shares, 6)} />
+                          <CalcRow label={t.method === "FIFO" ? "× Coût unitaire (FIFO)" : "× Coût unitaire (PMP)"} value={fmtEUR(t.buyPrice, 4)} />
+                          <CalcRow label="= Coût d'acquisition" value={fmtEUR(t.cost, 2)} strong />
+                          <div className="h-1" />
+                          <CalcRow label="Prix d'exécution" value={fmtEUR(t.sellPriceGross || t.sellPrice, 4)} />
+                          <CalcRow label="= Montant brut de la vente" value={fmtEUR(t.shares * (t.sellPriceGross || t.sellPrice), 2)} />
+                          {(t.fee || 0) > 0 && <CalcRow label="− Frais de courtage" value={"−" + fmtEUR(t.fee, 2)} neg />}
+                          {(t.tax || 0) > 0 && <CalcRow label="− Taxes prélevées" value={"−" + fmtEUR(t.tax, 2)} neg />}
+                          <CalcRow label="= Produit net encaissé" value={fmtEUR(t.proceeds, 2)} strong />
+                          <div className="h-1" />
+                          <CalcRow label="Produit net − Coût" value={fmtEUR(t.pnl, 2)} strong accent={t.pnl >= 0 ? "pos" : "neg"} />
+                          {!isPEA && taxOnTrade > 0 && <CalcRow label="− Impôt CTO estimé (31,4 %)" value={"−" + fmtEUR(taxOnTrade, 2)} neg />}
+                          {isPEA && <CalcRow label="Compte PEA" value="exonéré d'IR" />}
+                          <CalcRow label="= Net réel dans ta poche" value={fmtEUR(pnlNetReal, 2)} strong accent={pnlNetReal >= 0 ? "pos" : "neg"} />
+                        </div>
+                        <div className="text-[9px] text-slate-600 mt-2 leading-relaxed">
+                          {t.method === "PMP"
+                            ? "Le coût unitaire est le prix moyen de tous tes achats de cet actif — méthode fiscale française, identique à celle de l'app Trade Republic."
+                            : `Coût issu des ${t.lotCount} lot(s) d'achat le(s) plus ancien(s) — méthode FIFO. Les gains par vente diffèrent de l'app Trade Republic.`}
                         </div>
                       </div>
-                      <div className="text-right shrink-0">
-                        <div className={`text-sm font-mono font-bold tabular-nums ${classFor(t.pnl)}`}>
-                          {mask((t.pnl >= 0 ? "+" : "") + fmtEUR(t.pnl, 2).replace("+", ""), hide)}
-                        </div>
-                        <div className={`text-[9px] font-mono ${classFor(t.pnl)}`}>{fmtPct(t.pnlPct, 1)} brut</div>
-                        <div className="text-[9px] font-mono text-slate-500 mt-0.5">net {fmtEUR(pnlNetReal, 2)}{isPEA && " (PEA)"}</div>
-                      </div>
-                    </div>
+                    </details>
                   );
                 })}
               </div>
@@ -3368,6 +3535,50 @@ function Settings({ onImport, transactions, onClear, sectorOverrides, onSectorOv
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(txData), "Transactions");
     const trData = derived.realizedTrades.map(t => ({ Actif: t.name, ISIN: t.symbol, Secteur: sectorFn(t), "Achat": fmtDate(t.buyDate), "Vente": fmtDate(t.sellDate), "Durée (j)": t.holdingDays, "Qté": t.shares, "Prix achat": t.buyPrice, "Prix vente": t.sellPrice, "Coût": t.cost, "Produit": t.proceeds, "P&L": t.pnl, "P&L %": t.pnlPct }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(trData), "Trades réalisés");
+
+    // ═══ FEUILLE DE VÉRIFICATION : chaque étape du calcul, colonne par colonne ═══
+    // Permet de refaire les calculs à la main dans Excel et de les confronter à l'app TR.
+    const method = derived.calcMethod || "PMP";
+    const verif = (derived.consolidatedTrades || []).slice().sort((a, b) => b.sellDate - a.sellDate).map(t => ({
+      "Actif": t.name,
+      "ISIN": t.symbol,
+      "Compte": t.accountType === "PEA" ? "PEA" : "CTO",
+      "Date vente": fmtDate(t.sellDate),
+      "Méthode": method,
+      "A · Parts vendues": t.shares,
+      "B · Coût unitaire": t.buyPrice,
+      "C · Coût total (A×B)": t.cost,
+      "D · Prix exécution brut": t.sellPriceGross || t.sellPrice,
+      "E · Montant brut (A×D)": t.shares * (t.sellPriceGross || t.sellPrice),
+      "F · Frais": t.fee || 0,
+      "G · Taxes source": t.tax || 0,
+      "H · Produit net (E−F−G)": t.proceeds,
+      "I · Gain brut (E−C)": t.pnlGross != null ? t.pnlGross : t.pnl + (t.fee || 0) + (t.tax || 0),
+      "J · Gain net (H−C)": t.pnl,
+      "K · Contrôle (I−F−G−J)": (t.pnlGross != null ? t.pnlGross : t.pnl + (t.fee || 0) + (t.tax || 0)) - (t.fee || 0) - (t.tax || 0) - t.pnl,
+      "Rendement %": t.pnlPct,
+      "Détention (j)": t.holdingDays,
+      "Lots consommés": t.lotCount,
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(verif), "Vérification calculs");
+
+    // ═══ FEUILLE D'AUDIT : résultat des contrôles automatiques ═══
+    const a = derived.auditReport;
+    if (a) {
+      const auditRows = a.checks.map(c => ({
+        "Contrôle": c.label,
+        "Statut": c.status === "ok" ? "OK" : c.status === "warn" ? "VIGILANCE" : "PROBLÈME",
+        "Détail": c.detail,
+        "Éléments concernés": c.rows.map(r => `${r.label} (${r.detail})`).join(" | "),
+      }));
+      auditRows.push({ "Contrôle": "", "Statut": "", "Détail": "", "Éléments concernés": "" });
+      auditRows.push({ "Contrôle": "Méthode de calcul appliquée", "Statut": method, "Détail": method === "PMP" ? "Prix Moyen Pondéré — règle fiscale française, méthode Trade Republic" : "FIFO — méthode allemande", "Éléments concernés": "" });
+      auditRows.push({ "Contrôle": "Lignes de plus-value analysées", "Statut": String(a.tradeCount), "Détail": "", "Éléments concernés": "" });
+      auditRows.push({ "Contrôle": "Flux de trésorerie net", "Statut": a.cashFlow.toFixed(2) + " EUR", "Détail": "Dépôts − retraits − achats + ventes + revenus − carte", "Éléments concernés": "" });
+      auditRows.push({ "Contrôle": "Export généré le", "Statut": new Date().toLocaleString("fr-FR"), "Détail": "", "Éléments concernés": "" });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(auditRows), "Audit");
+    }
+
     XLSX.writeFile(wb, `portfolio_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
@@ -3389,6 +3600,67 @@ function Settings({ onImport, transactions, onClear, sectorOverrides, onSectorOv
 
   return (
     <div className="space-y-6">
+      {/* ═══ 🔍 AUDIT DES CALCULS ═══ */}
+      {derived?.auditReport && transactions.length > 0 && (() => {
+        const a = derived.auditReport;
+        const globalStatus = a.errors > 0 ? "error" : a.warns > 0 ? "warn" : "ok";
+        const STYLE = {
+          ok:    { box: "border-emerald-500/40 bg-emerald-500/5", dot: "bg-emerald-400", txt: "text-emerald-300", icon: "✓" },
+          warn:  { box: "border-amber-500/40 bg-amber-500/5",     dot: "bg-amber-400",   txt: "text-amber-300",   icon: "!" },
+          error: { box: "border-rose-500/40 bg-rose-500/5",       dot: "bg-rose-400",    txt: "text-rose-300",    icon: "✕" },
+        };
+        const g = STYLE[globalStatus];
+        return (
+          <Card className={globalStatus === "ok" ? "border-emerald-500/30" : globalStatus === "warn" ? "border-amber-500/30" : "border-rose-500/30"}>
+            <SectionTitle icon={Check} subtitle="Contrôles automatiques recalculés par des chemins indépendants">🔍 Audit des calculs</SectionTitle>
+
+            <div className={`rounded-xl border p-4 mb-4 ${g.box}`}>
+              <div className={`font-bold text-sm ${g.txt} mb-1`}>
+                {globalStatus === "ok" && "✓ Tous les contrôles passent"}
+                {globalStatus === "warn" && `! ${a.warns} point(s) de vigilance`}
+                {globalStatus === "error" && `✕ ${a.errors} problème(s) affectant tes chiffres`}
+              </div>
+              <div className="text-xs text-slate-400">
+                {a.tradeCount} ligne(s) de plus-value analysée(s) · {a.openCount} position(s) ouverte(s) ·
+                flux de trésorerie net {fmtEUR(a.cashFlow)}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {a.checks.map((c) => {
+                const st = STYLE[c.status];
+                return (
+                  <div key={c.id} className={`rounded-lg border p-3 ${st.box}`}>
+                    <div className="flex items-start gap-2.5">
+                      <span className={`w-5 h-5 rounded-full ${st.dot} text-slate-950 text-[11px] font-bold flex items-center justify-center shrink-0 mt-0.5`}>{st.icon}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold text-xs text-slate-100">{c.label}</div>
+                        <div className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">{c.detail}</div>
+                        {c.rows.length > 0 && (
+                          <div className="mt-2 space-y-1 font-mono text-[10px] text-slate-500 border-l-2 border-slate-700 pl-2">
+                            {c.rows.slice(0, 6).map((r, i) => (
+                              <div key={i}><span className="text-slate-300">{r.label}</span> — {r.detail}</div>
+                            ))}
+                            {c.rows.length > 6 && <div>… et {c.rows.length - 6} autre(s)</div>}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="text-[11px] text-slate-500 bg-slate-950 rounded-lg p-3 border border-slate-800 mt-4 leading-relaxed">
+              ℹ️ Ces contrôles vérifient la <strong className="text-slate-300">cohérence interne</strong> et la
+              <strong className="text-slate-300"> qualité des données importées</strong>. Ils ne peuvent pas garantir que
+              ton export Trade Republic est complet ni que les montants qu'il contient sont exacts — d'où le contrôle
+              n°3, qui est le plus important.
+            </div>
+          </Card>
+        );
+      })()}
+
       {/* ═══ MÉTHODE DE CALCUL DES PLUS-VALUES ═══ */}
       <Card className="border-cyan-500/30">
         <SectionTitle icon={Target} subtitle="Comment le prix de revient de tes ventes est calculé">🧮 Méthode de calcul des plus-values</SectionTitle>
